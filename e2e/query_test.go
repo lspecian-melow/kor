@@ -434,3 +434,41 @@ func TestSDKListDocuments(t *testing.T) {
 		}
 	}
 }
+
+// Added in this fork: name cursors containing NUL. The Python SDK's
+// recursive_delete bounds its descendants query with a reference ending in
+// "\x00/…"; PostgreSQL text cannot hold NUL, so such bounds must not reach SQL
+// as-is. NUL sorts below every other character.
+func TestSDKNameCursorWithNUL(t *testing.T) {
+	startKord(t)
+	client := newClient(t)
+	ctx := context.Background()
+	coll := client.Collection("nulcursor")
+	for _, id := range []string{"a", "ab", "b"} {
+		if _, err := coll.Doc(id).Set(ctx, map[string]any{"id": id}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	ids := func(q firestore.Query) []string {
+		t.Helper()
+		docs, err := q.Documents(ctx).GetAll()
+		if err != nil {
+			t.Fatalf("query: %v", err)
+		}
+		out := make([]string, len(docs))
+		for i, d := range docs {
+			out[i] = d.Ref.ID
+		}
+		return out
+	}
+	byName := coll.OrderBy(firestore.DocumentID, firestore.Asc)
+	if got := ids(byName.EndAt("a\x00")); fmt.Sprint(got) != "[a]" {
+		t.Fatalf("EndAt(a\\x00) = %v, want [a]", got)
+	}
+	if got := ids(byName.StartAfter("a\x00")); fmt.Sprint(got) != "[ab b]" {
+		t.Fatalf("StartAfter(a\\x00) = %v, want [ab b]", got)
+	}
+	if got := ids(byName.StartAt("a\x00").EndBefore("b")); fmt.Sprint(got) != "[ab]" {
+		t.Fatalf("StartAt(a\\x00).EndBefore(b) = %v, want [ab]", got)
+	}
+}

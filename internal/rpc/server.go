@@ -17,6 +17,7 @@ import (
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/emptypb"
 	"google.golang.org/protobuf/types/known/timestamppb"
+	"google.golang.org/protobuf/types/known/wrapperspb"
 
 	"github.com/omelas-tech/kor/internal/backend"
 	"github.com/omelas-tech/kor/internal/query"
@@ -80,46 +81,135 @@ func (s *Server) Rollback(ctx context.Context, req *pb.RollbackRequest) (*emptyp
 }
 
 // RunQuery executes a structured query and streams results.
+//
+// Modified in this fork: queries run inside transactions. The documents a
+// transactional query returns join the transaction's read set (locked and
+// version-checked at commit), as point reads do, so a concurrent change to any
+// of them aborts the commit and the SDK retries. Documents that start matching
+// the query after it ran are not detected (no predicate locks).
 func (s *Server) RunQuery(req *pb.RunQueryRequest, stream pb.Firestore_RunQueryServer) error {
-	if req.GetTransaction() != nil || req.GetNewTransaction() != nil || req.GetReadTime() != nil {
-		// Point-read transactions only, by design — see internal/store/txn.go.
-		return status.Error(codes.Unimplemented, "kor: queries inside transactions are not supported")
+	if req.GetReadTime() != nil {
+		return status.Error(codes.Unimplemented, "kor: read-time queries are not supported")
 	}
-	q, err := query.Parse(req.GetParent(), req.GetStructuredQuery())
+	txnID := req.GetTransaction()
+	var newTxn []byte
+	if req.GetNewTransaction() != nil {
+		newTxn = s.store.BeginTxn()
+		txnID = newTxn
+	}
+	docs, err := s.query(stream.Context(), req.GetParent(), req.GetStructuredQuery(), txnID)
 	if err != nil {
 		return err
 	}
 	readTime := timestamppb.New(time.Now().UTC().Truncate(time.Microsecond))
+	if len(docs) == 0 {
+		// Empty result: a document-less response carries the read time.
+		return stream.Send(&pb.RunQueryResponse{ReadTime: readTime, Transaction: newTxn})
+	}
+	for i, d := range docs {
+		resp := &pb.RunQueryResponse{Document: d, ReadTime: readTime}
+		if i == 0 {
+			resp.Transaction = newTxn
+		}
+		if err := stream.Send(resp); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// query runs a structured query with rule checks and returns the projected
+// documents. With txnID set, the returned documents are locked and their
+// versions recorded in that transaction's read set.
+func (s *Server) query(ctx context.Context, parent string, sq *pb.StructuredQuery, txnID []byte) ([]*pb.Document, error) {
+	q, err := query.Parse(parent, sq)
+	if err != nil {
+		return nil, err
+	}
 	var docs []*backend.Doc
-	if err := s.store.RunQuery(stream.Context(), q, func(doc *backend.Doc) error {
+	if err := s.store.RunQuery(ctx, q, func(doc *backend.Doc) error {
 		docs = append(docs, doc)
 		return nil
 	}); err != nil {
-		return err
+		return nil, err
 	}
-	if err := s.checkQueryRule(stream.Context(), q); err != nil {
-		return err
+	if err := s.checkQueryRule(ctx, q); err != nil {
+		return nil, err
 	}
-	if err := s.checkList(stream.Context(), docs); err != nil {
-		return err
+	if err := s.checkList(ctx, docs); err != nil {
+		return nil, err
 	}
-	sent := 0
+	if len(txnID) > 0 && len(docs) > 0 {
+		names := make([]string, len(docs))
+		reads := make(map[string]time.Time, len(docs))
+		for i, doc := range docs {
+			names[i] = doc.Name
+			reads[doc.Name] = doc.UpdateTime
+		}
+		if err := s.store.LockTxnReads(ctx, txnID, names); err != nil {
+			return nil, err
+		}
+		// The versions the query observed: a change between the query and
+		// the lock shows up as drift at commit and aborts it.
+		if err := s.store.RecordTxnReads(txnID, reads); err != nil {
+			return nil, err
+		}
+	}
+	out := make([]*pb.Document, 0, len(docs))
 	for _, doc := range docs {
 		d, err := docProto(doc)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		d.Fields = q.ApplyProjection(d.Fields)
-		sent++
-		if err := stream.Send(&pb.RunQueryResponse{Document: d, ReadTime: readTime}); err != nil {
-			return err
+		out = append(out, d)
+	}
+	return out, nil
+}
+
+// ListDocuments lists the documents of one collection in name order, a page at
+// a time, as the server SDKs' list_documents / DocumentRefs call it.
+//
+// Added in this fork. Only documents that exist are listed: show_missing's
+// "missing" documents (a path with subcollections but no document) are not.
+func (s *Server) ListDocuments(ctx context.Context, req *pb.ListDocumentsRequest) (*pb.ListDocumentsResponse, error) {
+	if req.GetReadTime() != nil || len(req.GetTransaction()) > 0 {
+		return nil, status.Error(codes.Unimplemented, "kor: ListDocuments in a transaction or at a read time is not supported")
+	}
+	if ob := req.GetOrderBy(); ob != "" && ob != "__name__" {
+		return nil, status.Error(codes.Unimplemented, "kor: ListDocuments orders by __name__ only")
+	}
+	if req.GetCollectionId() == "" {
+		return nil, status.Error(codes.InvalidArgument, "collection_id is required")
+	}
+	byName := &pb.StructuredQuery_FieldReference{FieldPath: "__name__"}
+	sq := &pb.StructuredQuery{
+		From:    []*pb.StructuredQuery_CollectionSelector{{CollectionId: req.GetCollectionId()}},
+		OrderBy: []*pb.StructuredQuery_Order{{Field: byName, Direction: pb.StructuredQuery_ASCENDING}},
+	}
+	if token := req.GetPageToken(); token != "" {
+		sq.StartAt = &pb.Cursor{Values: []*pb.Value{{ValueType: &pb.Value_ReferenceValue{ReferenceValue: token}}}, Before: false}
+	}
+	if size := req.GetPageSize(); size > 0 {
+		// One extra row tells whether another page exists.
+		sq.Limit = wrapperspb.Int32(size + 1)
+	}
+	if mask := req.GetMask(); mask != nil {
+		sq.Select = &pb.StructuredQuery_Projection{}
+		for _, path := range mask.GetFieldPaths() {
+			sq.Select.Fields = append(sq.Select.Fields, &pb.StructuredQuery_FieldReference{FieldPath: path})
 		}
 	}
-	if sent == 0 {
-		// Empty result: a document-less response carries the read time.
-		return stream.Send(&pb.RunQueryResponse{ReadTime: readTime})
+	docs, err := s.query(ctx, req.GetParent(), sq, nil)
+	if err != nil {
+		return nil, err
 	}
-	return nil
+	resp := &pb.ListDocumentsResponse{Documents: docs}
+	if size := int(req.GetPageSize()); size > 0 && len(docs) > size {
+		resp.Documents = docs[:size]
+		resp.NextPageToken = docs[size-1].GetName()
+	}
+	return resp, nil
 }
 
 // RunAggregationQuery supports count() (with up_to); sum/avg return

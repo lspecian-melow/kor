@@ -15,8 +15,10 @@ import (
 // re-locks every read and written document with SELECT ... FOR UPDATE,
 // verifies the recorded versions are unchanged, and applies the writes — or
 // returns ABORTED so the SDK's RunTransaction retries. This is serializable
-// for point-read transactions; queries inside transactions are rejected
-// upstream until predicate validation exists.
+// for point-read transactions. Queries inside transactions record the
+// documents they returned the same way (internal/rpc RunQuery); documents that
+// start matching a query after it ran are not detected, because there is no
+// predicate validation.
 
 // BeginTxn starts a transaction and returns its opaque id.
 func (s *Store) BeginTxn() []byte { return s.txns.Begin() }

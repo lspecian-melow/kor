@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"math"
 	"sort"
+	"strings"
 	"time"
 
 	pb "cloud.google.com/go/firestore/apiv1/firestorepb"
@@ -70,6 +71,17 @@ func (s *Store) RunQuery(ctx context.Context, q *query.Query, yield func(*Doc) e
 	return s.runGeneral(ctx, q, where, args, yield)
 }
 
+// sqlNameBound reports whether a cursor bound can be pushed down to
+// PostgreSQL. Its text type cannot hold NUL, and SDKs do send NUL: the Python
+// SDK's recursive_delete ends its descendants range at a reference whose
+// collection segment ends in "\x00". Firestore compares names segment by
+// segment, so such a bound does not even sort like a byte string, and no
+// truncated SQL bound is a safe superset. It stays out of SQL, and
+// InCursorRange applies it to every row. Added in this fork.
+func sqlNameBound(bound string) bool {
+	return !strings.ContainsRune(bound, 0)
+}
+
 // runNameOrdered streams in __name__ order straight from Postgres — the
 // batch-scan fast path (OrderBy(DocumentID) + StartAfter + Limit).
 func (s *Store) runNameOrdered(ctx context.Context, q *query.Query, where string, args []any, dir query.Direction, yield func(*Doc) error) error {
@@ -80,7 +92,7 @@ func (s *Store) runNameOrdered(ctx context.Context, q *query.Query, where string
 		cmpStart, cmpEnd = "<", ">"
 	}
 	if start, end, startIncl, endIncl, ok := q.NameCursorBounds(); ok {
-		if start != "" {
+		if start != "" && sqlNameBound(start) {
 			op := cmpStart
 			if startIncl {
 				op += "="
@@ -88,7 +100,7 @@ func (s *Store) runNameOrdered(ctx context.Context, q *query.Query, where string
 			args = append(args, start)
 			where += fmt.Sprintf(" AND name %s $%d", op, len(args))
 		}
-		if end != "" {
+		if end != "" && sqlNameBound(end) {
 			op := cmpEnd
 			if endIncl {
 				op += "="
@@ -232,6 +244,11 @@ func (s *Store) RunCount(ctx context.Context, q *query.Query, upTo int64) (int64
 }
 
 func (s *Store) baseConditions(q *query.Query) (string, []any) {
+	if q.AllDescendants && q.CollectionID == "" {
+		// Kindless scan under parent: every collection at any depth, as the
+		// SDKs' recursive queries ask for. Added in this fork.
+		return "name >= $1 AND name < $2", []any{q.Parent + "/", q.Parent + "0"}
+	}
 	if q.AllDescendants {
 		// Collection-group scan under parent: any depth, matching collection id.
 		return "collection_id = $1 AND name >= $2 AND name < $3",

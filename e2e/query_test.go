@@ -337,3 +337,138 @@ func TestSDKTransactions(t *testing.T) {
 		}
 	})
 }
+
+// Added in this fork: queries inside transactions. Workers claim open jobs by
+// querying for one and updating it in the same transaction, the way job
+// queues built on Firestore do. Every job is claimed exactly once.
+func TestSDKTransactionQueryClaims(t *testing.T) {
+	startKord(t)
+	client := newClient(t)
+	ctx := context.Background()
+	jobs := client.Collection("claims")
+	const jobCount, workers = 10, 30
+	for i := 0; i < jobCount; i++ {
+		if _, err := jobs.Doc(fmt.Sprintf("job%02d", i)).Set(ctx, map[string]any{"status": "open", "n": int64(i)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var (
+		mu      sync.Mutex
+		claimed = map[string]int{}
+		wg      sync.WaitGroup
+	)
+	errs := make(chan error, workers)
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func(w int) {
+			defer wg.Done()
+			var got string
+			err := client.RunTransaction(ctx, func(ctx context.Context, tx *firestore.Transaction) error {
+				got = ""
+				docs, err := tx.Documents(jobs.Where("status", "==", "open").OrderBy("n", firestore.Asc).Limit(1)).GetAll()
+				if err != nil || len(docs) == 0 {
+					return err
+				}
+				got = docs[0].Ref.ID
+				return tx.Update(docs[0].Ref, []firestore.Update{{Path: "status", Value: fmt.Sprintf("worker-%d", w)}})
+			})
+			if err == nil && got != "" {
+				mu.Lock()
+				claimed[got]++
+				mu.Unlock()
+			}
+			errs <- err
+		}(w)
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatalf("claim transaction failed: %v", err)
+		}
+	}
+	if len(claimed) != jobCount {
+		t.Fatalf("claimed %d distinct jobs, want %d: %v", len(claimed), jobCount, claimed)
+	}
+	for id, n := range claimed {
+		if n != 1 {
+			t.Fatalf("job %s claimed %d times (double claim)", id, n)
+		}
+	}
+}
+
+// Added in this fork: ListDocuments, which the server SDKs use for
+// CollectionRef.DocumentRefs / list_documents, paged by the SDK.
+func TestSDKListDocuments(t *testing.T) {
+	startKord(t)
+	client := newClient(t)
+	ctx := context.Background()
+	coll := client.Collection("listed")
+	const count = 25
+	for i := 0; i < count; i++ {
+		if _, err := coll.Doc(fmt.Sprintf("d%02d", i)).Set(ctx, map[string]any{"i": int64(i)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := client.Collection("other").Doc("x").Set(ctx, map[string]any{"i": int64(0)}); err != nil {
+		t.Fatal(err)
+	}
+	var ids []string
+	it := coll.DocumentRefs(ctx)
+	for {
+		ref, err := it.Next()
+		if err == iterator.Done {
+			break
+		}
+		if err != nil {
+			t.Fatalf("DocumentRefs: %v", err)
+		}
+		ids = append(ids, ref.ID)
+	}
+	if len(ids) != count {
+		t.Fatalf("listed %d documents, want %d: %v", len(ids), count, ids)
+	}
+	for i, id := range ids {
+		if want := fmt.Sprintf("d%02d", i); id != want {
+			t.Fatalf("ids[%d] = %s, want %s (name order)", i, id, want)
+		}
+	}
+}
+
+// Added in this fork: name cursors containing NUL. The Python SDK's
+// recursive_delete bounds its descendants query with a reference ending in
+// "\x00/…"; PostgreSQL text cannot hold NUL, so such bounds must not reach SQL
+// as-is. NUL sorts below every other character.
+func TestSDKNameCursorWithNUL(t *testing.T) {
+	startKord(t)
+	client := newClient(t)
+	ctx := context.Background()
+	coll := client.Collection("nulcursor")
+	for _, id := range []string{"a", "ab", "b"} {
+		if _, err := coll.Doc(id).Set(ctx, map[string]any{"id": id}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	ids := func(q firestore.Query) []string {
+		t.Helper()
+		docs, err := q.Documents(ctx).GetAll()
+		if err != nil {
+			t.Fatalf("query: %v", err)
+		}
+		out := make([]string, len(docs))
+		for i, d := range docs {
+			out[i] = d.Ref.ID
+		}
+		return out
+	}
+	byName := coll.OrderBy(firestore.DocumentID, firestore.Asc)
+	if got := ids(byName.EndAt("a\x00")); fmt.Sprint(got) != "[a]" {
+		t.Fatalf("EndAt(a\\x00) = %v, want [a]", got)
+	}
+	if got := ids(byName.StartAfter("a\x00")); fmt.Sprint(got) != "[ab b]" {
+		t.Fatalf("StartAfter(a\\x00) = %v, want [ab b]", got)
+	}
+	if got := ids(byName.StartAt("a\x00").EndBefore("b")); fmt.Sprint(got) != "[ab]" {
+		t.Fatalf("StartAt(a\\x00).EndBefore(b) = %v, want [ab]", got)
+	}
+}
